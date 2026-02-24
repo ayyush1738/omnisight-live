@@ -1,36 +1,58 @@
 import { WebSocket, WebSocketServer } from 'ws';
-import { GeminiService } from '../services/gemini.service';
+import { IncomingMessage } from 'http';
+import { RoomManager } from '../managers/room.manager';
 import { logger } from '../utils/logger';
 
 export class SocketController {
+  private roomManager: RoomManager;
+
   constructor(wss: WebSocketServer) {
+    // 🚨 FIXED: Use the Singleton instance so WS and API share the same memory state
+    this.roomManager = RoomManager.getInstance();
     this.init(wss);
   }
 
   private init(wss: WebSocketServer) {
-    // This triggers the moment your Next.js frontend calls `new WebSocket(...)`
-    wss.on('connection', (ws: WebSocket) => {
-      logger.info('🔌 New client connected to OmniSight Live Stream');
+    // Capture 'req' to extract roomId and role from the connection URL
+    wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
+      try {
+        /**
+         * Parsing the connection URL. 
+         * Expected frontend connection: ws://backend:8080/live?role=technician&roomId=room123
+         */
+        const baseURL = req.headers.host ? `http://${req.headers.host}` : 'http://localhost';
+        const url = new URL(req.url || '/', baseURL);
+        
+        const role = url.searchParams.get('role') as 'technician' | 'expert' | null;
+        const roomId = url.searchParams.get('roomId');
 
-      // 1. Instantiate a FRESH GeminiService for this specific user.
-      // This is critical for scaling. If two people use the app at once, 
-      // they each get their own isolated AI brain and session context.
-      const geminiService = new GeminiService();
+        // Validation: Kick connections that don't identify themselves
+        if (!role || !roomId) {
+          logger.warn('Connection rejected: Missing role or roomId in URL.');
+          ws.send(JSON.stringify({ type: 'error', message: 'Missing roomId or role.' }));
+          ws.close();
+          return;
+        }
 
-      // 2. Hand the WebSocket over to the Service layer to open the AI pipe.
-      // The GeminiService will now take over listening to ws.on('message')
-      // to process the streaming audio and video frames.
-      geminiService.startLiveSession(ws);
+        if (role !== 'technician' && role !== 'expert') {
+          logger.warn(`Connection rejected: Invalid role '${role}'`);
+          ws.close();
+          return;
+        }
 
-      // 3. Handle high-level network lifecycle events
-      ws.on('close', () => {
-        logger.info('❌ Client disconnected from WebSocket server.');
-        // The GeminiService also listens to 'close' to safely kill the API connection.
-      });
+        logger.info(`🔌 [Room: ${roomId}] New client joined as [${role.toUpperCase()}]`);
 
-      ws.on('error', (err) => {
-        logger.error('WebSocket connection error:', err);
-      });
+        /**
+         * Hand the WebSocket over to the RoomManager.
+         * For 'technician': It starts a Gemini session.
+         * For 'expert': It starts mirroring the technician's feed to this socket.
+         */
+        this.roomManager.joinRoom(roomId, role, ws);
+
+      } catch (error) {
+        logger.error('Critical failure during WebSocket handshake:', error);
+        ws.close();
+      }
     });
   }
 }

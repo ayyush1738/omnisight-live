@@ -5,26 +5,47 @@ import { WebSocket } from "ws";
 
 export class GeminiService {
     private client: GoogleGenAI;
+    private session: any = null; // Store session reference for external injection
     
-    // 🚨 FIX 1: Removed "models/Preview: ". It MUST be exactly this string.
-    private model: string = "gemini-2.5-flash-native-audio-preview-12-2025";
+    // Model string must be exact
+    private model: string = "gemini-2.0-flash-exp"; 
 
     constructor() {
         this.client = new GoogleGenAI({ apiKey: config.geminiApiKey });
+    }
+
+    /**
+     * Injects a command from the Remote Expert into the live AI conversation.
+     * This is the "Ghost Mode" bridge.
+     */
+    public injectExpertCommand(text: string) {
+        if (this.session) {
+            logger.info(`Injecting Expert instruction into Gemini: ${text}`);
+            this.session.send({
+                realtimeInput: {
+                    mediaChunks: [{
+                        mimeType: "text/plain",
+                        data: Buffer.from(text).toString("base64")
+                    }]
+                }
+            });
+        } else {
+            logger.warn("Cannot inject expert command: No active Gemini session.");
+        }
     }
 
     public async startLiveSession(ws: WebSocket) {
         logger.info("Initializing Gemini Live Session...");
 
         try {
-            const session = await this.client.live.connect({
+            // Connect to the Live API
+            this.session = await (this.client as any).live.connect({
                 model: this.model,
                 config: {
-                    // 🚨 FIX 2: Cast to 'any' to bypass incomplete SDK types
                     responseModalities: ["AUDIO" as any], 
                     systemInstruction: {
                         parts: [{
-                            text: "You are OmniSight, an expert field technician AI. You are assisting the user via a live camera feed. Keep responses extremely brief, under 2 sentences. If you see a dangerous or incorrect action, interrupt immediately with 'Stop'."
+                            text: "You are OmniSight, an expert field technician AI. You are assisting a user via live camera. Keep responses extremely brief (under 2 sentences). If the user is about to make a mistake, say 'Stop'. A remote senior engineer may occasionally send you instructions; relay them naturally to the user."
                         }]
                     }
                 },
@@ -33,10 +54,11 @@ export class GeminiService {
                         logger.info("Connected to Gemini Live API.");
                         ws.send(JSON.stringify({ type: "connection_status", status: "ready" }));
                     },
-                    onmessage: (geminiResponse) => {
+                    onmessage: (geminiResponse: any) => {
+                        // Forward AI audio/transcript back to the technician
                         ws.send(JSON.stringify(geminiResponse));
                     },
-                    onerror: (error) => {
+                    onerror: (error: any) => {
                         logger.error("Gemini Live API Error: ", error);
                         ws.send(JSON.stringify({ type: "error", message: "AI Engine Error." }));
                     },
@@ -46,12 +68,14 @@ export class GeminiService {
                 }
             });
 
+            // Handle incoming data from the Technician's phone
             ws.on("message", (message: string | Buffer) => {
                 try {
+                    if (!this.session) return;
+
                     if (Buffer.isBuffer(message)) {
-                        // Raw Audio Buffer from Mic
-                        // 🚨 FIX 3: Cast session to 'any' because 'send' is missing from the preview types
-                        (session as any).send({
+                        // Stream raw PCM audio
+                        this.session.send({
                             realtimeInput: {
                                 mediaChunks: [{
                                     mimeType: "audio/pcm;rate=16000",
@@ -60,17 +84,18 @@ export class GeminiService {
                             }
                         });
                     } else {
-                        // JSON data (Video Frames)
+                        // Stream JSON (Video Frames / Control Messages)
                         const data = JSON.parse(message.toString());
-                        (session as any).send(data);
+                        this.session.send(data);
                     }
                 } catch (err) {
-                    logger.error("Error parsing frontend message", err);
+                    logger.error("Error parsing technician message", err);
                 }
             });
 
             ws.on("close", () => {
-                logger.info("❌ Frontend client disconnected. Cleaning up AI session.");
+                logger.info("❌ Technician disconnected. Ending AI session.");
+                this.session = null;
             });
 
         } catch (error) {
